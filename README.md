@@ -37,6 +37,8 @@ Core Features:
 
 * Tqdm
 
+* tensorboard>=2.10.0
+
 ### Installing
 
 Clone the repository:
