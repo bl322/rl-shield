@@ -1,6 +1,6 @@
 # RL-Shield
 
-Endogenous Dynamic Defense for Large Language Models using Reinforcement Learning to mitigate automated jailbreak attacks.
+《Endogenous Dynamic Defense for Large Language Models using Reinforcement Learning to mitigate automated jailbreak attacks》
 
 ## Description
 
