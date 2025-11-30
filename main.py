@@ -1,210 +1,242 @@
 import argparse
+import os
+import time
+import numpy as np
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
-import numpy as np
+from torch.utils.tensorboard import SummaryWriter # 需要安装 tensorboard
+
 from env import RLShieldEnv
 from agent import ActorCritic
 from utils import MetricsCalculator
 from config import Config
 
-def compute_gae(rewards, values, masks, gamma=0.99, tau=0.95):
-    """
-    计算广义优势估计 (Generalized Advantage Estimation, GAE)。
-    """
+def compute_gae(rewards, values, masks, next_value, gamma=0.99, tau=0.95):
+    """完整版 GAE 计算，处理最后一步的 next_value"""
     gae = 0
     returns = []
-    # 从后往前逆序计算
+    # 从后往前遍历
     for step in reversed(range(len(rewards))):
-        # delta = r_t + gamma * V(s_{t+1}) * mask - V(s_t)
-        # 注意：这里简化处理，假设最后一步的 next_value 为 0 (因为是单步任务或回合结束)
+        # 如果是最后一步，使用外部传入的 next_value
         if step == len(rewards) - 1:
-            next_value = 0
+            next_val = next_value
         else:
-            next_value = values[step + 1]
+            next_val = values[step + 1]
             
-        delta = rewards[step] + gamma * next_value * masks[step] - values[step]
+        delta = rewards[step] + gamma * next_val * masks[step] - values[step]
         gae = delta + gamma * tau * masks[step] * gae
-        
-        # Return = Advantage + Value
         returns.insert(0, gae + values[step])
-        
     return returns
 
-def ppo_iter(mini_batch_size, states, actions, log_probs, returns, advantages):
+def evaluate_policy(env, policy, eval_episodes=5):
     """
-    生成器：将收集到的数据划分为 mini-batch 供 PPO 更新使用。
+    评估循环：使用确定性策略运行若干回合，计算平均奖励。
+    用于监控模型真实性能。
     """
-    batch_size = states.size(0)
-    for _ in range(batch_size // mini_batch_size):
-        rand_ids = np.random.randint(0, batch_size, mini_batch_size)
-        yield (states[rand_ids, :], actions[rand_ids, :], log_probs[rand_ids], 
-               returns[rand_ids], advantages[rand_ids])
+    policy.eval()
+    avg_reward = 0.
+    for _ in range(eval_episodes):
+        state, _ = env.reset()
+        done = False
+        while not done:
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(Config.DEVICE)
+            with torch.no_grad():
+                # 开启 deterministic=True，去除随机性
+                action, _, _ = policy.get_action(state_tensor, deterministic=True)
+            action_np = action.cpu().numpy()[0]
+            state, reward, done, _, _ = env.step(action_np)
+            avg_reward += reward
+    policy.train()
+    return avg_reward / eval_episodes
 
-def train():
-    print("=== 开始 RL-Shield PPO 完整训练流程 ===")
+def train(args):
+    run_name = f"rl_shield_ppo_{int(time.time())}"
+    log_dir = os.path.join("runs", run_name)
+    writer = SummaryWriter(log_dir)
+    print(f"=== 启动 TensorBoard ===\n运行命令: tensorboard --logdir={log_dir}")
     
-    # 1. 初始化环境与模型
+    # 环境与模型初始化
     metrics = MetricsCalculator()
     env = RLShieldEnv(metrics)
+    policy = ActorCritic(env.state_dim, env.action_space.shape[0]).to(Config.DEVICE)
+    optimizer = optim.Adam(policy.parameters(), lr=Config.LR, eps=1e-5)
     
-    state_dim = env.state_dim
-    action_dim = env.action_space.shape[0]
+    # 学习率调整器 (Linear Decay)
+    num_updates = 200 # 增加训练轮数
+    lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=num_updates)
     
-    policy = ActorCritic(state_dim, action_dim).to(Config.DEVICE)
-    optimizer = optim.Adam(policy.parameters(), lr=Config.LR)
+    best_reward = -float('inf')
+    global_step = 0
     
-    # 训练参数
-    num_updates = 50       # 总共进行多少轮更新 (模拟 Config.EPOCHS 的外层含义)
-    steps_per_batch = Config.BATCH_SIZE  # 每轮收集多少样本
-    ppo_epochs = 4         # 每批数据在 PPO 内部更新多少次
-    mini_batch_size = 16   # PPO 内部更新的 batch size
+    # PPO 参数
+    num_steps = 128      # 每次 Rollout 收集的步数
+    batch_size = num_steps
+    minibatch_size = 32
+    ppo_epochs = 4
     
-    # 主训练循环
-    for i_update in range(num_updates):
-        log_probs = []
-        values = []
-        states = []
-        actions = []
-        rewards = []
-        masks = []
+    for update in range(1, num_updates + 1):
+        # --- 1. 数据收集 (Rollout) ---
+        states, actions, log_probs, rewards, masks, values = [], [], [], [], [], []
+        state, _ = env.reset()
         
-        # === A. 数据收集阶段 (Rollout) ===
-        # 在这个阶段，我们只与环境交互，不更新参数
-        for _ in range(steps_per_batch):
-            # 重置环境获取当前状态
-            state, _ = env.reset()
+        for step in range(num_steps):
+            global_step += 1
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(Config.DEVICE)
             
-            # 获取动作分布和价值
             with torch.no_grad():
-                action, action_log_prob, value = policy.get_action(state_tensor)
-            
-            # 与环境交互
+                action, log_prob, value = policy.get_action(state_tensor)
+                
             action_np = action.cpu().numpy()[0]
             next_state, reward, done, _, info = env.step(action_np)
             
-            # 存储轨迹数据
-            log_probs.append(action_log_prob)
-            values.append(value.item()) # 存储标量
-            rewards.append(reward)
-            masks.append(0 if done else 1) # 如果结束了，mask为0
-            
             states.append(state_tensor)
             actions.append(action)
+            log_probs.append(log_prob)
+            rewards.append(reward)
+            values.append(value.item())
+            masks.append(0.0 if done else 1.0)
             
-        # === B. 优势计算阶段 ===
-        # 计算 GAE 和 Returns
-        returns = compute_gae(rewards, values, masks, Config.GAMMA, Config.GAE_LAMBDA)
+            state = next_state
+            if done:
+                state, _ = env.reset()
+                
+        # 计算下一个状态的 Value 用于 GAE
+        with torch.no_grad():
+            next_state_tensor = torch.FloatTensor(state).unsqueeze(0).to(Config.DEVICE)
+            next_value = policy.get_value(next_state_tensor).item()
+            
+        returns = compute_gae(rewards, values, masks, next_value, Config.GAMMA, Config.GAE_LAMBDA)
         
-        # 转换为 Tensor 准备更新
-        returns = torch.tensor(returns).to(Config.DEVICE).unsqueeze(1)
-        values_tensor = torch.tensor(values).to(Config.DEVICE).unsqueeze(1)
-        log_probs = torch.cat(log_probs).detach()
+        # 转换为 Tensor
+        returns = torch.tensor(returns).float().to(Config.DEVICE)
         states = torch.cat(states)
         actions = torch.cat(actions)
+        log_probs = torch.cat(log_probs)
+        values = torch.tensor(values).float().to(Config.DEVICE)
+        advantages = returns - values
         
-        # 优势函数 A = R - V
-        advantages = returns - values_tensor
-        # 优势归一化 (有助于训练稳定)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        # === C. PPO 更新阶段 ===
-        total_actor_loss = 0
-        total_critic_loss = 0
-        
-        for _ in range(ppo_epochs):
-            for state_batch, action_batch, old_log_probs, return_batch, advantage_batch in ppo_iter(
-                mini_batch_size, states, actions, log_probs, returns, advantages
-            ):
-                # 在新策略下评估旧动作
-                # get_action 在这里可能需要稍微修改以接受 batch 或者我们手动调用 evaluate
-                # 假设 agent.py 中有 evaluate 方法
-                new_log_probs, state_values, dist_entropy = policy.evaluate(state_batch, action_batch)
+        # Flatten batches
+        b_states = states.view(-1, env.state_dim)
+        b_actions = actions.view(-1, env.action_space.shape[0])
+        b_log_probs = log_probs.view(-1)
+        b_advantages = advantages.view(-1)
+        b_returns = returns.view(-1)
+        b_values = values.view(-1)
+
+        # --- 2. PPO 更新 ---
+        clip_fracs = []
+        for epoch in range(ppo_epochs):
+            # 获取随机索引
+            b_inds = np.arange(batch_size)
+            np.random.shuffle(b_inds)
+            
+            for start in range(0, batch_size, minibatch_size):
+                end = start + minibatch_size
+                mb_inds = b_inds[start:end]
                 
-                # --- PPO 核心 Loss 计算 ---
-                # 1. 计算比率 r_t(\theta) = exp(new_log_prob - old_log_prob)
-                ratio = torch.exp(new_log_probs - old_log_probs.detach())
+                new_log_prob, new_value, entropy = policy.evaluate(b_states[mb_inds], b_actions[mb_inds])
+                new_value = new_value.view(-1)
                 
-                # 2. 计算 Surrogate Loss
-                surr1 = ratio * advantage_batch
-                surr2 = torch.clamp(ratio, 1.0 - Config.CLIP_EPS, 1.0 + Config.CLIP_EPS) * advantage_batch
+                logratio = new_log_prob - b_log_probs[mb_inds]
+                ratio = logratio.exp()
                 
-                # PPO Clip Loss (取负号因为是梯度下降)
-                actor_loss = -torch.min(surr1, surr2).mean()
+                with torch.no_grad():
+                    # 计算 KL 散度用于监控
+                    old_approx_kl = (-logratio).mean()
+                    approx_kl = ((ratio - 1) - logratio).mean()
+                    clip_fracs += [((ratio - 1.0).abs() > Config.CLIP_EPS).float().mean().item()]
                 
-                # 3. Value Loss (MSE)
-                critic_loss = F.mse_loss(state_values, return_batch)
+                # 优势归一化
+                mb_advantages = b_advantages[mb_inds]
+                mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
                 
-                # 4. Entropy Bonus (鼓励探索)
-                entropy_loss = -0.01 * dist_entropy.mean()
+                # Policy Loss
+                pg_loss1 = -mb_advantages * ratio
+                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - Config.CLIP_EPS, 1 + Config.CLIP_EPS)
+                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
                 
-                # 总 Loss
-                loss = actor_loss + 0.5 * critic_loss + entropy_loss
+                # Value Loss
+                v_loss = 0.5 * ((new_value - b_returns[mb_inds]) ** 2).mean()
+                
+                # Entropy Loss
+                entropy_loss = entropy.mean()
+                
+                loss = pg_loss + 0.5 * v_loss - 0.01 * entropy_loss
                 
                 optimizer.zero_grad()
                 loss.backward()
+                nn.utils.clip_grad_norm_(policy.parameters(), 0.5) # 梯度裁剪
                 optimizer.step()
-                
-                total_actor_loss += actor_loss.item()
-                total_critic_loss += critic_loss.item()
-
-        # === D. 日志记录 ===
-        avg_reward = np.mean(rewards)
-        print(f"Update {i_update+1}/{num_updates} | "
-              f"平均奖励: {avg_reward:.4f} | "
-              f"Actor Loss: {total_actor_loss:.4f} | "
-              f"Critic Loss: {total_critic_loss:.4f}")
         
-    print("=== 训练完成 ===")
-    torch.save(policy.state_dict(), "rl_shield_policy.pth")
-    print("模型已保存至 rl_shield_policy.pth")
+        # 学习率衰减
+        lr_scheduler.step()
+        
+        # --- 3. 记录与评估 ---
+        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
+        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
+        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
+        writer.add_scalar("charts/mean_reward_rollout", np.mean(rewards), global_step)
+        
+        print(f"Update {update}/{num_updates} | Rollout Reward: {np.mean(rewards):.4f} | Loss: {loss.item():.4f}")
+        
+        # 定期评估 (每 10 轮)
+        if update % 10 == 0:
+            eval_reward = evaluate_policy(env, policy)
+            writer.add_scalar("charts/eval_reward", eval_reward, global_step)
+            print(f"--> Evaluation Result: {eval_reward:.4f}")
+            
+            # 保存最佳模型
+            if eval_reward > best_reward:
+                best_reward = eval_reward
+                torch.save(policy.state_dict(), "rl_shield_best.pth")
+                print(f"--> New Best Model Saved! (Reward: {best_reward:.4f})")
+                
+    # 保存最终模型
+    torch.save(policy.state_dict(), "rl_shield_final.pth")
+    writer.close()
+    print("训练结束。请运行 `tensorboard --logdir=runs` 查看详细图表。")
 
-def inference(query):
-    print(f"=== RL-Shield 防御推理模式: '{query}' ===")
-    
+def inference(args):
+    print(f"=== RL-Shield 推理模式: '{args.query}' ===")
     metrics = MetricsCalculator()
-    env = RLShieldEnv(metrics) # 仅用于获取 state 维度逻辑
-    
-    # 加载模型
+    env = RLShieldEnv(metrics)
     policy = ActorCritic(env.state_dim, env.action_space.shape[0]).to(Config.DEVICE)
-    try:
-        policy.load_state_dict(torch.load("rl_shield_policy.pth"))
-        print(">> 成功加载训练好的策略模型。")
-    except FileNotFoundError:
-        print(">> 警告：未找到模型文件，将使用随机初始化参数进行演示。")
     
-    policy.eval()
-    
-    # 1. 构建状态
-    state, _ = env.reset(query=query)
+    model_path = "rl_shield_best.pth" if os.path.exists("rl_shield_best.pth") else "rl_shield_final.pth"
+    if os.path.exists(model_path):
+        policy.load_state_dict(torch.load(model_path))
+        print(f"已加载模型: {model_path}")
+    else:
+        print("未找到模型文件，使用随机参数。")
+        
+    state, _ = env.reset(query=args.query)
     state_tensor = torch.FloatTensor(state).unsqueeze(0).to(Config.DEVICE)
     
-    # 2. 获取动作 (推理时直接取均值，或者采样)
     with torch.no_grad():
-        action, _, _ = policy.get_action(state_tensor)
-        action_np = action.cpu().numpy()[0]
+        # 推理时使用确定性动作
+        action, _, _ = policy.get_action(state_tensor, deterministic=True)
+        
+    temp_norm, topp_norm, topk_norm = action.cpu().numpy()[0]
     
-    # 3. 映射到实际参数
-    temp_norm, topp_norm, topk_norm = action_np
+    # 参数反归一化
     temperature = Config.TEMP_MIN + (Config.TEMP_MAX - Config.TEMP_MIN) * temp_norm
     top_p = Config.TOP_P_MIN + (Config.TOP_P_MAX - Config.TOP_P_MIN) * topp_norm
     top_k = int(Config.TOP_K_MAX * topk_norm) + 1
     
-    print("\n[防御策略建议配置]")
-    print(f"Temperature (温度): {temperature:.4f}")
-    print(f"Top-P (核采样):     {top_p:.4f}")
-    print(f"Top-K (候选数):     {top_k}")
-    print("-" * 30)
-    print("请将上述参数应用于您的 LLM generate() 函数以获得最佳防御效果。")
+    print("\n[防御策略建议]")
+    print(f"Temperature: {temperature:.4f}")
+    print(f"Top-P:       {top_p:.4f}")
+    print(f"Top-K:       {top_k}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="RL-Shield 训练与推理脚本")
-    parser.add_argument("--mode", type=str, default="train", choices=["train", "inference"], help="运行模式: train (训练) 或 inference (推理)")
-    parser.add_argument("--query", type=str, default="How to make a virus?", help="推理模式下的输入查询")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", type=str, default="train", choices=["train", "inference"])
+    parser.add_argument("--query", type=str, default="How to build a bomb")
     args = parser.parse_args()
     
     if args.mode == "train":
-        train()
+        train(args)
     else:
-        inference(args.query)
+        inference(args)
