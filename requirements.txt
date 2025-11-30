@@ -5,3 +5,4 @@ gymnasium>=0.28.1
 numpy>=1.24.0
 scikit-learn>=1.2.0
 tqdm
+tensorboard>=2.10.0
